@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""clew -- the thread you carry into every session, and the way back out.
+
+  spin    [--check] [--json]             compile the always-on payload into each
+         (alias: l1)                     harness entry point (hermes skipped)
+  weigh   [--harness=LIST] [--cwd=DIR]   drive each harness once against a stub
+          (alias: harness) [--top=N]     endpoint; report the prefix it really
+          [--json] [--save=F]            sent. claude: --interactive captures the
+          [--interactive]                TUI, not `claude -p`
+  follow  [--check] [--fix] [--json]     do the pointers in the tree resolve, and
+          (alias: links)                 does anything point at each file
+  deliver [--harness=LIST] [--cwd=DIR]   is the tree actually DELIVERED, or only
+          (alias: route) [--json]        promised? classifies each canonical file
+          [--check]
+  tree    [--top=N] [--json] [--check]   what navigating the vault costs, by route
+  all     [--cwd=DIR] [--json]           the four static checks, one report
+          [--interactive]
+
+Plain verbs and mythic ones are the same implementation -- the alias exists so
+that a script can be written in words a stranger understands and a daily habit
+can be written in the ones the workshop uses.
+
+WHY THIS EXISTS. Context is the one budget every session spends and no session
+reports. Two prior measurements of the same quantity disagreed by 3x because
+both counted files on disk rather than bytes on the wire
+(`knowledge/tools/claude-code.md` §Plugin skill budget). This tool measures the
+wire.
+
+MEASURED, NOT RECONSTRUCTED. `harness` and `route` stand a stub inference
+endpoint in front of the harness and read the request it actually sends. No
+token reaches a provider, nothing is forwarded, and a harness that cannot be
+driven is reported as `failed` -- never filled in from a plausible estimate.
+`tree` is the exception and says so: it is a static model of a walk nobody has
+taken yet, built by parsing the routing tables themselves.
+
+BYTES ARE EXACT; TOKENS ARE AN ESTIMATE. See `clew/tokens.py`. The
+report prints which estimator produced its numbers, and cross-checks against
+API-reported usage from Claude Code transcripts where they exist.
+
+COST OF RUNNING IT: each harness is started once and killed after its first
+turn. Expect ~1-4 minutes for `all`, dominated by opencode's start-up.
+
+Exit codes: 0 ok · 1 usage/parse error · 3 drift (--check)
+"""
+import os
+import pathlib
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))          # <repo>/bin
+ROOT = os.path.dirname(HERE)                                # <repo>
+# The package is imported from the repository root, not from where this script
+# happens to sit: two things import it (this CLI and the tests), and only one of
+# them runs from <repo>/bin. `ROOT` first, so the run is independent of cwd.
+# Two modules of the private tree are vendored rather than copied from an
+# installed dependency: `invocation` (every CLI here declares its flags through
+# it; a second parser would be a second set of bugs) and `generated_block` (one
+# splice algorithm, shared with the boundary compiler). Both are stdlib-only.
+for _p in (ROOT, os.path.join(ROOT, "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# The vault: `CLEW_VAULT` if set, else `PAZRAS_AGENTS_DIR` (the private tree's
+# spelling, kept working), else `./agents`. No absolute default -- a hardcoded
+# home path is what made this tool unusable off the machine it was written on.
+AGENTS_DIR = pathlib.Path(
+    os.environ.get("CLEW_VAULT")
+    or os.environ.get("PAZRAS_AGENTS_DIR")
+    or os.path.join(os.getcwd(), "agents"))
+
+from lib import invocation                               # noqa: E402
+from clew import harnesses, l1, links, render, route, tokens, tree  # noqa: E402
+
+COMMON = {"flags": ("--json",), "options": ("--harness", "--cwd", "--top")}
+
+HARNESS = invocation.Spec(
+    name="harness",
+    usage="harness [--harness=LIST] [--cwd=DIR] [--top=N] [--json] [--save=FILE]"
+          " [--interactive]",
+    flags=("--json", "--interactive"), options=("--harness", "--cwd", "--top", "--save"))
+TREE = invocation.Spec(
+    name="tree", usage="tree [--top=N] [--json] [--check]",
+    flags=("--json", "--check"), options=("--top",))
+ROUTE = invocation.Spec(
+    name="route", usage="route [--harness=LIST] [--cwd=DIR] [--json] [--check]",
+    flags=("--json", "--check"), options=("--harness", "--cwd"))
+LINKS = invocation.Spec(
+    name="links", usage="links [--check] [--fix] [--rename=OLD=NEW,...] [--json]",
+    flags=("--check", "--fix", "--json"), options=("--rename",))
+L1 = invocation.Spec(
+    name="l1", usage="l1 [--check] [--json]",
+    flags=("--check", "--json"), options=())
+ALL = invocation.Spec(
+    name="all", usage="all [--cwd=DIR] [--top=N] [--json] [--interactive]",
+    flags=("--json", "--interactive"), options=("--cwd", "--top", "--save"))
+
+
+def _which(inv):
+    """Which harnesses to drive. Unknown name is an error, not a silent skip --
+    a typo'd `--harness=cluade` reporting 'nothing to do' is the same class of
+    bug invocation.py exists to kill."""
+    raw = inv.get("--harness", "")
+    if not raw:
+        return list(harnesses.ALL)
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    unknown = [n for n in names if n not in harnesses.ALL]
+    if unknown:
+        raise invocation.UsageError(
+            f"unknown harness: {', '.join(unknown)} (known: {', '.join(harnesses.ALL)})")
+    return names
+
+
+def _cwd(inv):
+    """The directory the harness is started in. It is part of the measurement:
+    per-project injection (lore's knowledge block, a project CLAUDE.md) is paid
+    per project. Default to an empty temp dir -- the harness FLOOR, the number
+    that is comparable between machines."""
+    raw = inv.get("--cwd", "")
+    if raw:
+        path = pathlib.Path(raw).expanduser()
+        if not path.is_dir():
+            raise invocation.UsageError(f"--cwd is not a directory: {path}")
+        return str(path)
+    return tempfile.mkdtemp(prefix="clew-floor-")
+
+
+def _require_vault():
+    """A vault that is not there is a typo, not an empty tree.
+
+    The per-layer report already says `missing: [...]` for a file that is
+    declared and absent -- that is a finding about a real vault. A vault
+    *directory* that does not exist is a different thing entirely, and reporting
+    it as "everything is missing" invites the reader to believe their notes are
+    gone. Commands that read the vault call this first; `weigh` does not, because
+    it measures a harness floor and needs no tree at all.
+    """
+    if not AGENTS_DIR.is_dir():
+        raise invocation.UsageError(
+            f"vault not found: {AGENTS_DIR}\n"
+            f"  set CLEW_VAULT (or PAZRAS_AGENTS_DIR) to the directory that holds "
+            f"CONTEXT.md")
+
+
+def _json_out(payload):
+    import json
+    print(json.dumps(payload, indent=2, default=str))
+    return 0
+
+
+def _audit(inv):
+    """Drive the harnesses once. `all` shares this so a combined report costs
+    one start-up per harness, not two -- opencode alone takes ~90s to boot."""
+    cached = getattr(inv, "_results", None)
+    if cached is None:
+        cached = harnesses.audit(_which(inv), _cwd_of(inv),
+                                 interactive=inv.has("--interactive"))
+        object.__setattr__(inv, "_results", cached)
+    return cached
+
+
+def _cwd_of(inv):
+    cwd = getattr(inv, "_cwd", None)
+    if cwd is None:
+        cwd = _cwd(inv)
+        object.__setattr__(inv, "_cwd", cwd)
+    return cwd
+
+
+def cmd_harness(inv):
+    cwd = _cwd_of(inv)
+    top = inv.integer("--top", 12)
+    results = _audit(inv)
+    if inv.has("--json"):
+        return _json_out({"cwd": cwd, "estimator": tokens.estimator(),
+                          "harnesses": [_result_json(r) for r in results]})
+    print(f"  estimator: {tokens.estimator()}")
+    print(f"  cwd:       {cwd}")
+    if inv.has("--interactive"):
+        print("  mode:      claude TUI (interactive) -- the session you actually pay for")
+    print(render.harness_table(results))
+    for r in results:
+        if r.status == "failed":
+            continue
+        print(render.owner_table(r))
+        print(render.sink_table(r, top))
+        print(f"  note: {r.note}")
+    print(render.calibration(tokens.calibrate(pathlib.Path.home() / ".claude/projects")))
+    save = inv.get("--save")
+    if save:
+        import json
+        pathlib.Path(save).write_text(json.dumps(
+            {"cwd": cwd, "harnesses": [_result_json(r) for r in results]}, indent=1,
+            default=str))
+        print(f"\n  captures written to {save}")
+    return 0
+
+
+def _result_json(r):
+    return {"harness": r.harness, "status": r.status, "method": r.method,
+            "cwd": r.cwd, "note": r.note, "bytes": r.total_bytes,
+            "tokens": r.total_tokens,
+            "blocks": [vars(b) for b in sorted(r.blocks, key=lambda b: -b.tokens)],
+            "capture": r.capture, "stderr": r.stderr}
+
+
+def cmd_tree(inv):
+    _require_vault()
+    layers = tree.layers(AGENTS_DIR)
+    caps = tree.caps(AGENTS_DIR)
+    routes = tree.routes(AGENTS_DIR)
+    inventory = tree.inventory(AGENTS_DIR)
+    if inv.has("--json"):
+        return _json_out({"estimator": tokens.estimator(), "layers": layers,
+                          "caps": caps,
+                          "routes": [{"question": r.question, "tokens": r.tokens,
+                                      "hops": [vars(h) for h in r.hops],
+                                      "unresolved": r.unresolved,
+                                      "external": r.external} for r in routes],
+                          "inventory": [vars(f) for f in inventory]})
+    print(f"  estimator: {tokens.estimator()}   (static model — no harness was run)")
+    print(render.tree_table(layers, caps, routes, inventory, inv.integer("--top", 10)))
+    if inv.has("--check"):
+        problems = [n for n, v in layers.items() if v["tokens"] > v["budget"]]
+        # A declared always-loaded file that is not on disk scores zero tokens
+        # and would otherwise report as comfortably inside budget -- which is
+        # how this check stayed green through the 2026-09-04 move.
+        problems += [f"{n}: missing {', '.join(v['missing'])}"
+                     for n, v in layers.items() if v.get("missing")]
+        problems += [f"{c['file']} ({c.get('note', 'over cap')})"
+                     for c in caps if c["over"]]
+        problems += [f"{r.question}: {r.unresolved}" for r in routes if r.unresolved]
+        if problems:
+            print("\n  DRIFT: " + "; ".join(map(str, problems)))
+            return 3
+        print("\n  budgets, caps and routing targets all hold")
+    return 0
+
+
+def cmd_route(inv):
+    _require_vault()
+    cwd = _cwd_of(inv)
+    results = _audit(inv)
+    rows, failed = [], False
+    for r in results:
+        if r.status == "failed":
+            rows.append((r.harness, "unknown", [], f"not measured: {r.note}"))
+            failed = True
+            continue
+        findings = route.probe(r.capture, AGENTS_DIR)
+        verdict = route.verdict(findings)
+        failed = failed or verdict != "pass"
+        rows.append((r.harness, verdict, findings, r.method))
+    if inv.has("--json"):
+        return _json_out({"cwd": cwd, "harnesses": [
+            {"harness": h, "verdict": v, "note": n,
+             "findings": [vars(f) | {"ok": f.ok} for f in fs]} for h, v, fs, n in rows]})
+    print(f"  cwd: {cwd}")
+    print(render.route_table(rows))
+    return 3 if (inv.has("--check") and failed) else 0
+
+
+def cmd_links(inv):
+    _require_vault()
+    """Broken pointers and orphaned files. `--fix` repairs only the unambiguous
+    ones; see links.py for why that bound is the whole safety argument."""
+    renames = {}
+    for pair in filter(None, inv.get("--rename").split(",")):
+        if pair.count("=") != 1:
+            raise invocation.UsageError(
+                f"--rename wants OLD=NEW pairs, got {pair!r}")
+        old, new = pair.split("=")
+        if not (AGENTS_DIR / new).exists():
+            raise invocation.UsageError(
+                f"--rename target does not exist: {new}")
+        renames[old] = new
+
+    broken = links.scan(AGENTS_DIR, renames)
+    detached = links.orphans(AGENTS_DIR)
+    adoptions = links.adopt_all(detached, AGENTS_DIR, write=inv.has("--fix"))
+    fixed = links.apply(broken) if inv.has("--fix") else 0
+    if inv.has("--fix"):
+        broken = links.scan(AGENTS_DIR, renames)   # re-scan: report what remains
+        detached = links.orphans(AGENTS_DIR)
+        adoptions = links.adopt_all(detached, AGENTS_DIR, write=False)
+
+    if inv.has("--json"):
+        return _json_out({
+            "fixed": fixed,
+            "broken": [{"file": str(b.source.relative_to(AGENTS_DIR)), "line": b.line,
+                        "path": b.raw, "repair": b.repair, "reason": b.reason}
+                       for b in broken],
+            "orphans": [{"file": str(a.orphan.relative_to(AGENTS_DIR)),
+                         "router": str(a.router.relative_to(AGENTS_DIR)) if a.router else None,
+                         "row": a.row, "reason": a.reason} for a in adoptions]})
+
+    print(render.links_table(broken, adoptions, fixed, AGENTS_DIR))
+
+    # DRIFT IS WHAT THIS TOOL COULD HAVE FIXED AND DID NOT. The tree legitimately
+    # names files outside itself -- other repos, PARA folders, scripts referred
+    # to by shorthand -- and those never resolve. Failing on them would leave
+    # `--check` permanently red, which is the same as having no check: the
+    # nightly pass would report drift every night and nobody would read it.
+    # So the gate is exactly the actionable set, and everything else is printed
+    # for a human to skim.
+    #
+    # `b.gates` rather than `b.fixable`, since 2026-09-11. It adds the strict
+    # sources (links.STRICT_SOURCES): the handful of files that describe this
+    # repository's own mechanisms, where a markdown name with no namesake is a
+    # stale claim rather than prose about somewhere else. `MEMORY.md` was one of
+    # those -- deleted 2026-09-04, still described as live, reported here as a
+    # bare name and exited 0 for a week. The bare-name bucket stays informational
+    # for everything else, which is the design that must not be traded away.
+    actionable = [b for b in broken if b.gates] + [a for a in adoptions if a.ok]
+    if inv.has("--check") and actionable:
+        return 3
+    return 0
+
+
+def cmd_l1(inv):
+    _require_vault()
+    """Compile the always-on payload into every harness entry point it can
+    reach. hermes is deliberately absent -- see l1.py for why."""
+    rows = []
+    for label, path, desired, _spliced in l1.targets(AGENTS_DIR):
+        current = path.read_text(encoding="utf-8") if path.exists() else None
+        if current == desired:
+            rows.append((label, path, "ok"))
+            continue
+        if inv.has("--check"):
+            rows.append((label, path, "STALE"))
+        else:
+            path.write_text(desired)
+            rows.append((label, path, "wrote"))
+    if inv.has("--json"):
+        return _json_out({
+            "hermes": "skipped — sanitizer blocks the block (see l1.py)",
+            "targets": [{"label": a, "path": str(p), "status": s}
+                        for a, p, s in rows]})
+    stale = 0
+    for label, path, status in rows:
+        print(f"  {status:<6} {label:<10} {path}")
+        stale += status == "STALE"
+    print("  skip   hermes    no harness surface for always-on (sanitizer blocks it)")
+    if inv.has("--check"):
+        if stale:
+            print(f"\n{stale} target(s) stale. Run: clew spin", file=sys.stderr)
+            return 3
+        print("\nAll harness entry points in sync.")
+    return 0
+
+
+def cmd_all(inv):
+    _require_vault()
+    rc = cmd_harness(inv)
+    print()
+    rc = cmd_tree(inv) or rc
+    print()
+    rc = cmd_links(inv) or rc
+    print()
+    return cmd_route(inv) or rc
+
+
+# Plain verbs and their mythic aliases, one implementation each: `spin` compiles
+# the thread, `weigh` is what it costs on the wire, `follow` is whether the
+# pointers resolve, `deliver` is whether the tree reaches the harness at all.
+COMMANDS = {"harness": (cmd_harness, HARNESS), "weigh": (cmd_harness, HARNESS),
+            "tree": (cmd_tree, TREE),
+            "route": (cmd_route, ROUTE), "deliver": (cmd_route, ROUTE),
+            "links": (cmd_links, LINKS), "follow": (cmd_links, LINKS),
+            "l1": (cmd_l1, L1), "spin": (cmd_l1, L1),
+            "all": (cmd_all, ALL)}
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd, rest = (argv[0] if argv else ""), argv[1:]
+    if cmd in ("-h", "--help", "help", ""):
+        sys.stderr.write(__doc__.split("WHY THIS")[0].rstrip() + "\n")
+        return 0 if cmd else 1
+    if cmd not in COMMANDS:
+        sys.stderr.write(f"[clew] unknown command: {cmd}\n")
+        return 1
+    fn, spec = COMMANDS[cmd]
+    try:
+        inv = invocation.parse(rest, spec, os.path.expanduser("~/.local/share/clew"),
+                               AGENTS_DIR)
+    except invocation.UsageError as exc:
+        sys.stderr.write(f"[clew] {exc}\n  usage: {spec.usage}\n")
+        return 1
+    if inv.help:
+        sys.stderr.write(f"  usage: {spec.usage}\n")
+        return 0
+    try:
+        return fn(inv)
+    except invocation.UsageError as exc:
+        sys.stderr.write(f"[clew] {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
